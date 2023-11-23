@@ -9,6 +9,7 @@ use std::{
 };
 
 use lazy_static::lazy_static;
+use nom::AsBytes;
 use regex::Regex;
 
 const GET: &'static str = "GET";
@@ -41,33 +42,16 @@ enum HttpResponse {
     Ok(Option<String>),
     OkStream(Option<Vec<u8>>),
     NotFound,
+    BadRequest,
     Created,
 }
 
 trait IntoResponse {
-    fn into_response(&self) -> String;
-}
-trait IntoStreamResponse {
-    fn into_stream_response(&self) -> Vec<u8>;
+    fn into_response(&self) -> Vec<u8>;
 }
 
-impl IntoStreamResponse for HttpResponse {
-    fn into_stream_response(&self) -> Vec<u8> {
-        match self {
-            HttpResponse::OkStream(Some(body)) => {
-                let content_length = body.len();
-                let response_headers = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
-                        content_length,
-                    );
-                [response_headers.as_bytes().to_vec(), body.to_owned()].concat()
-            }
-            _ => self.into_response().as_bytes().to_vec(),
-        }
-    }
-}
 impl IntoResponse for HttpResponse {
-    fn into_response(&self) -> String {
+    fn into_response(&self) -> Vec<u8> {
         match self {
             HttpResponse::Ok(body) => {
                 return match body {
@@ -77,14 +61,29 @@ impl IntoResponse for HttpResponse {
                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
                         content_length,
                         body
-                    )
+                    ).as_bytes().to_vec()
                     }
-                    None => format!("HTTP/1.1 200 OK\r\n\r\n"),
+                    None => format!("HTTP/1.1 200 OK\r\n\r\n").as_bytes().to_vec(),
                 }
             }
-            HttpResponse::NotFound => format!("HTTP/1.1 404 NOT FOUND\r\n\r\n"),
-            HttpResponse::Created => format!("HTTP/1.1 201 CREATED\r\n\r\n"),
-            _ => String::default(),
+            HttpResponse::OkStream(body) => match body {
+                Some(body) => {
+                    let content_length = body.len();
+                    let response_headers = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                                content_length,
+                            );
+                    [response_headers.as_bytes().to_vec(), body.to_owned()].concat()
+                }
+                None => HttpResponse::BadRequest.into_response(),
+            },
+            HttpResponse::BadRequest => format!("HTTP/1.1 400 BAD REQUEST\r\n\r\n")
+                .as_bytes()
+                .to_vec(),
+            HttpResponse::NotFound => format!("HTTP/1.1 404 NOT FOUND\r\n\r\n")
+                .as_bytes()
+                .to_vec(),
+            HttpResponse::Created => format!("HTTP/1.1 201 CREATED\r\n\r\n").as_bytes().to_vec(),
         }
     }
 }
@@ -178,15 +177,6 @@ impl<'a> FromStr for HttpRequest<'a> {
         })
     }
 }
-fn extract_user_agent<T>(s: &T) -> Option<String>
-where
-    T: AsRef<str>,
-{
-    let string = s.as_ref();
-    let caps = USER_AGENT_RE.captures(string)?;
-    let matching = caps.get(1)?;
-    Some(matching.as_str().to_string())
-}
 
 fn get_arg(a: &'static str) -> Option<String> {
     let mut args = std::env::args();
@@ -246,6 +236,56 @@ fn process_stream(stream: &mut TcpStream) -> io::Result<(Vec<u8>, usize)> {
     Ok((buffer, _body_start))
 }
 
+fn create_response(req: &HttpRequest) -> HttpResponse {
+    let mut response = HttpResponse::NotFound;
+    let HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    } = req;
+    if method == GET {
+        if path.is_empty() {
+            // Stage 2
+            response = HttpResponse::Ok(None);
+        } else if let Some(echo) = extract_path_echo(&path) {
+            // Stage 4
+            response = HttpResponse::Ok(Some(echo));
+        } else if path == USER_AGENT_PATH {
+            match headers.get("User-Agent") {
+                Some(TypedHeader::Str(user_agent)) => {
+                    response = HttpResponse::Ok(Some(user_agent.to_string()));
+                }
+                _ => {}
+            }
+        } else if path.contains(FILES_PATH) {
+            // Stage 7
+            if let (Some(dir_name), Some(file_name)) =
+                (get_arg(DIR_PATH), extract_path_filename(&path))
+            {
+                let mut file_path = PathBuf::from(dir_name);
+                file_path.push(&file_name);
+                if let Ok(contents) = file_contents(&file_path) {
+                    response = HttpResponse::OkStream(Some(contents));
+                }
+            }
+        }
+    } else if method == POST {
+        // Stage 8
+        if path.contains(FILES_PATH) {
+            if let (Some(dir_name), Some(file_name), Some(data)) =
+                (get_arg(DIR_PATH), extract_path_filename(&path), body)
+            {
+                let mut file_path = PathBuf::from(dir_name);
+                file_path.push(&file_name);
+                if let Ok(_written_bytes) = write_file(&file_path, &data) {
+                    response = HttpResponse::Created;
+                }
+            }
+        }
+    }
+    response
+}
 fn main() {
     println!("Logs from program will appear here!");
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
@@ -257,82 +297,16 @@ fn main() {
                     println!("Accepted new connection"); // Stage 1
                     if let Ok((buf, body_pos)) = process_stream(&mut stream) {
                         let req_str = String::from_utf8_lossy(&buf[..body_pos]);
-                        let mut response = HttpResponse::NotFound;
-
-                        match HttpRequest::from_str(&req_str)
+                        let response = match HttpRequest::from_str(&req_str)
                             .map(|req| req.with_body(&buf[body_pos..]))
                         {
-                            Some(HttpRequest {
-                                method,
-                                path,
-                                headers,
-                                body,
-                            }) => {
-
-                                if method == GET {
-                                    if path.is_empty() {
-                                        // Stage 2
-                                        response = HttpResponse::Ok(None);
-                                    } else if let Some(echo) = extract_path_echo(&path) {
-                                        // Stage 4
-                                        response = HttpResponse::Ok(Some(echo));
-                                    } else if path == USER_AGENT_PATH {
-                                        match headers.get("User-Agent") {
-                                            Some(TypedHeader::Str(user_agent)) => {
-                                                response =
-                                                    HttpResponse::Ok(Some(user_agent.to_string()));
-                                            }
-                                            _ => {}
-                                        }
-                                    } else if path.contains(FILES_PATH) {
-                                        // Stage 7
-                                        if let (Some(dir_name), Some(file_name)) =
-                                            (get_arg(DIR_PATH), extract_path_filename(&path))
-                                        {
-                                            let mut file_path = PathBuf::from(dir_name);
-                                            file_path.push(&file_name);
-                                            if let Ok(contents) = file_contents(&file_path) {
-                                                response = HttpResponse::OkStream(Some(contents));
-                                            }
-                                        }
-                                    }
-                                } else if method == POST {
-                                    // Stage 8
-                                    if path.contains(FILES_PATH) {
-                                        if let (Some(dir_name), Some(file_name), Some(data)) =
-                                            (get_arg(DIR_PATH), extract_path_filename(&path), body)
-                                        {
-                                            let mut file_path = PathBuf::from(dir_name);
-                                            file_path.push(&file_name);
-                                            if let Ok(_written_bytes) =
-                                                write_file(&file_path, &data)
-                                            {
-                                                response = HttpResponse::Created;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            Some(req) => create_response(&req),
                             _ => {
                                 println!("Server does not support the http request {req_str}");
+                                HttpResponse::BadRequest
                             }
                         };
-                        match response {
-                            HttpResponse::OkStream(_) => {
-                                stream.write_all(&response.into_stream_response()).unwrap();
-                            }
-                            HttpResponse::Ok(_) | HttpResponse::Created => {
-                                stream
-                                    .write_all(&response.into_response().as_bytes())
-                                    .unwrap();
-                            }
-                            _ => {
-                                // Stage 3 - Not found
-                                stream
-                                    .write_all(HttpResponse::NotFound.into_response().as_bytes())
-                                    .unwrap();
-                            }
-                        }
+                        stream.write_all(&response.into_response()).unwrap();
                         stream.flush().unwrap(); // Flush the stream
                     }
                 }
